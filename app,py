@@ -1,0 +1,837 @@
+from flask import Flask, render_template, request, jsonify, send_file, session
+import sqlite3
+from datetime import datetime, date, timedelta
+import io, csv
+from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
+import threading
+import time
+
+try:
+    from recommendation_model import (
+        recommendation_model, 
+        init_recommendation_model, 
+        get_ml_recommendations,
+        retrain_model
+    )
+    ML_AVAILABLE = True
+    print("✓ ML Recommendation model imported successfully")
+except ImportError as e:
+    print(f"⚠ Warning: Could not import recommendation model: {e}")
+    ML_AVAILABLE = False
+
+app = Flask(__name__)
+app.secret_key = "replace_this_with_a_strong_secret_in_production"
+
+FINE_PER_DAY = 50
+
+if ML_AVAILABLE:
+    def init_ml_async():
+        print("🤖 Initializing recommendation model...")
+        try:
+            init_recommendation_model()
+            print("✓ Recommendation model ready!")
+        except Exception as e:
+            print(f"⚠ Warning: Model initialization failed: {e}")
+    
+    threading.Thread(target=init_ml_async, daemon=True).start()
+
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'admin' not in session:
+            return jsonify({"message": "Admin authentication required"}), 401
+        return f(*args, **kwargs)
+    return decorated_function
+
+def get_db_connection():
+    conn = sqlite3.connect('library.db')
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = sqlite3.connect('library.db')
+    cur = conn.cursor()
+
+    cur.execute('''CREATE TABLE IF NOT EXISTS books (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    author TEXT NOT NULL,
+                    category TEXT,
+                    status TEXT DEFAULT 'available'
+                )''')
+
+    cur.execute('''CREATE TABLE IF NOT EXISTS members (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    email TEXT,
+                    phone TEXT
+                )''')
+
+    cur.execute('''CREATE TABLE IF NOT EXISTS issued_books (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    book_id INTEGER,
+                    member_id INTEGER,
+                    issue_date TEXT,
+                    due_date TEXT,
+                    return_date TEXT,
+                    FOREIGN KEY(book_id) REFERENCES books(id),
+                    FOREIGN KEY(member_id) REFERENCES members(id)
+                )''')
+
+    cur.execute('''CREATE TABLE IF NOT EXISTS admins(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE,
+                    password_hash TEXT
+                )''')
+
+    cur.execute("SELECT COUNT(*) FROM admins")
+    if cur.fetchone()[0] == 0:
+        pw_hash = generate_password_hash("admin123")
+        cur.execute("INSERT INTO admins (username, password_hash) VALUES (?, ?)", ("admin", pw_hash))
+
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def calculate_fine(due_date_str, return_date_str=None):
+    fmt = "%Y-%m-%d"
+    try:
+        due = datetime.strptime(due_date_str, fmt).date()
+    except Exception:
+        return 0
+    end = datetime.strptime(return_date_str, fmt).date() if return_date_str else date.today()
+    overdue_days = (end - due).days
+    return FINE_PER_DAY * overdue_days if overdue_days > 0 else 0
+
+@app.route('/')
+def home():
+    return render_template('index.html')
+
+@app.route('/check_admin', methods=['GET'])
+def check_admin():
+    return jsonify({"is_admin": 'admin' in session})
+
+@app.route('/get_statistics', methods=['GET'])
+def get_statistics():
+    try:
+        conn = sqlite3.connect('library.db')
+        cur = conn.cursor()
+        
+        cur.execute("SELECT COUNT(*) FROM books")
+        total_books = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM books WHERE status='available'")
+        available_books = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM books WHERE status='borrowed'")
+        borrowed_books = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM members")
+        total_members = cur.fetchone()[0]
+
+        conn.close()
+
+        return jsonify({
+            "total_books": total_books,
+            "available_books": available_books,
+            "borrowed_books": borrowed_books,
+            "total_members": total_members
+        })
+    except Exception as e:
+        print(f"Error in get_statistics: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/get_books_paginated', methods=['GET'])
+def get_books_paginated():
+    filter_type = request.args.get('filter', 'all')
+    search = request.args.get('search', '').strip().lower()
+    page = int(request.args.get('page', 1))
+    per_page = int(request.args.get('per_page', 10))
+    sort_by = request.args.get('sort', 'title')
+    sort_order = request.args.get('order', 'asc')
+
+    offset = (page - 1) * per_page
+
+    conn = sqlite3.connect('library.db')
+    cur = conn.cursor()
+
+    query = "SELECT * FROM books WHERE 1=1"
+    params = []
+
+    if filter_type == 'available':
+        query += " AND status='available'"
+    elif filter_type == 'borrowed':
+        query += " AND status='borrowed'"
+
+    if search:
+        query += " AND (LOWER(title) LIKE ? OR LOWER(author) LIKE ? OR LOWER(category) LIKE ?)"
+        params.extend([f"%{search}%"] * 3)
+
+    cur.execute(query, params)
+    total = len(cur.fetchall())
+
+    if sort_by not in ['title', 'author', 'category', 'status', 'id']:
+        sort_by = 'title'
+    order_clause = 'ASC' if sort_order.lower() == 'asc' else 'DESC'
+    query += f" ORDER BY {sort_by} {order_clause}"
+
+    query += " LIMIT ? OFFSET ?"
+    params.extend([per_page, offset])
+
+    cur.execute(query, params)
+    rows = cur.fetchall()
+    conn.close()
+
+    books = [{"id": r[0], "title": r[1], "author": r[2], "category": r[3], "status": r[4]} for r in rows]
+    return jsonify({"books": books, "total": total, "page": page, "per_page": per_page})
+
+@app.route('/get_book_details/<int:book_id>', methods=['GET'])
+def get_book_details(book_id):
+    conn = sqlite3.connect('library.db')
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM books WHERE id=?", (book_id,))
+    book = cur.fetchone()
+    if not book:
+        conn.close()
+        return jsonify({"error": "Book not found"}), 404
+
+    cur.execute("""
+        SELECT ib.id, ib.member_id, m.name, ib.issue_date, ib.due_date, ib.return_date
+        FROM issued_books ib LEFT JOIN members m ON ib.member_id = m.id
+        WHERE ib.book_id=? ORDER BY ib.id DESC LIMIT 1
+    """, (book_id,))
+    issue = cur.fetchone()
+    conn.close()
+
+    issued_to = None
+    issue_date = None
+    return_date = None
+    if issue and issue[5] is None:
+        issued_to = issue[2]
+        issue_date = issue[3]
+        return_date = issue[5]
+
+    return jsonify({
+        "id": book[0],
+        "title": book[1],
+        "author": book[2],
+        "category": book[3],
+        "status": book[4],
+        "issued_to": issued_to,
+        "issue_date": issue_date,
+        "return_date": return_date
+    })
+
+@app.route('/get_members_paginated', methods=['GET'])
+def get_members_paginated():
+    search = request.args.get('search', '').strip().lower()
+    page = int(request.args.get('page', 1))
+    per_page = int(request.args.get('per_page', 10))
+    offset = (page - 1) * per_page
+
+    conn = sqlite3.connect('library.db')
+    cur = conn.cursor()
+
+    query = "SELECT * FROM members WHERE 1=1"
+    params = []
+    if search:
+        query += " AND LOWER(name) LIKE ?"
+        params.append(f"%{search}%")
+
+    cur.execute(query, params)
+    total = len(cur.fetchall())
+
+    query += " LIMIT ? OFFSET ?"
+    params.extend([per_page, offset])
+    cur.execute(query, params)
+    rows = cur.fetchall()
+    conn.close()
+
+    members = [{"id": r[0], "name": r[1], "email": r[2], "phone": r[3]} for r in rows]
+    return jsonify({"members": members, "total": total, "page": page, "per_page": per_page})
+
+@app.route('/get_member/<int:member_id>', methods=['GET'])
+def get_member(member_id):
+    conn = sqlite3.connect('library.db')
+    cur = conn.cursor()
+    cur.execute("SELECT id, name, email, phone FROM members WHERE id=?", (member_id,))
+    r = cur.fetchone()
+    if not r:
+        conn.close()
+        return jsonify({"error": "Member not found"}), 404
+    member = {"id": r[0], "name": r[1], "email": r[2], "phone": r[3]}
+
+    cur.execute('''SELECT ib.id, ib.book_id, b.title, ib.issue_date, ib.due_date, ib.return_date
+                    FROM issued_books ib LEFT JOIN books b ON ib.book_id = b.id
+                    WHERE ib.member_id=? ORDER BY ib.id DESC''', (member_id,))
+    rows = cur.fetchall()
+    history = []
+    for row in rows:
+        fine = 0
+        if row[4]:
+            fine = calculate_fine(row[4], row[5])
+        history.append({
+            "issue_id": row[0],
+            "book_id": row[1],
+            "title": row[2],
+            "issue_date": row[3],
+            "due_date": row[4],
+            "return_date": row[5],
+            "fine": fine
+        })
+    conn.close()
+    return jsonify({"member": member, "history": history})
+
+@app.route('/stats_summary', methods=['GET'])
+def stats_summary():
+    try:
+        conn = sqlite3.connect('library.db')
+        cur = conn.cursor()
+        
+        cur.execute("SELECT COUNT(*) FROM books")
+        total_books = cur.fetchone()[0] or 0
+        
+        cur.execute("SELECT COUNT(*) FROM books WHERE status='available'")
+        available_books = cur.fetchone()[0] or 0
+        
+        cur.execute("SELECT COUNT(*) FROM books WHERE status='borrowed'")
+        borrowed_books = cur.fetchone()[0] or 0
+        
+        cur.execute("SELECT COUNT(*) FROM members")
+        total_members = cur.fetchone()[0] or 0
+        
+        cur.execute("SELECT COALESCE(category, 'Uncategorized') as cat, COUNT(*) as c FROM books GROUP BY category ORDER BY c DESC LIMIT 6")
+        cats = cur.fetchall()
+        conn.close()
+        
+        return jsonify({
+            "total_books": total_books,
+            "available_books": available_books,
+            "borrowed_books": borrowed_books,
+            "total_members": total_members,
+            "top_categories": [{"category": r[0], "count": r[1]} for r in cats]
+        })
+    except Exception as e:
+        print(f"Error in stats_summary: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/get_issued_books')
+def get_issued_books():
+    conn = sqlite3.connect('library.db')
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT ib.id AS issue_id,
+               b.title,
+               m.name AS member_name
+        FROM issued_books ib
+        JOIN books b ON ib.book_id = b.id
+        JOIN members m ON ib.member_id = m.id
+        WHERE ib.return_date IS NULL
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    issued_books = []
+    for r in rows:
+        issued_books.append({
+            "issue_id": r[0],
+            "title": r[1],
+            "member_name": r[2]
+        })
+
+    return jsonify(issued_books)
+
+@app.route('/get_member_context/<int:member_id>')
+def get_member_context(member_id):
+    conn = get_db_connection()
+    c = conn.cursor()
+
+    c.execute("SELECT id, name FROM members WHERE id = ?", (member_id,))
+    member = c.fetchone()
+    if not member:
+        conn.close()
+        return jsonify({"error": "Member not found"}), 404
+
+    c.execute("""
+        SELECT b.id, b.title, b.author, b.category, i.issue_date, i.return_date
+        FROM issued_books i
+        JOIN books b ON i.book_id = b.id
+        WHERE i.member_id = ?
+        ORDER BY i.issue_date DESC
+        LIMIT 10
+    """, (member_id,))
+    history = c.fetchall()
+
+    conn.close()
+
+    return jsonify({
+        "member": {
+            "id": member['id'],
+            "name": member['name']
+        },
+        "history": [dict(row) for row in history]
+    })
+
+@app.route('/generate_ai_recommendations/<int:member_id>')
+def generate_ai_recommendations(member_id):
+    print(f"\n🤖 Generating recommendations for member {member_id}")
+    
+    if not ML_AVAILABLE:
+        print("⚠ ML model not available, using fallback")
+        return generate_fallback_recommendations(member_id)
+    
+    try:
+        recommendations = get_ml_recommendations(member_id, num_recommendations=5)
+        
+        if recommendations and len(recommendations) > 0:
+            print(f"✓ ML model generated {len(recommendations)} recommendations")
+            return jsonify(recommendations)
+        else:
+            print("⚠ ML model returned no recommendations, using fallback")
+            return generate_fallback_recommendations(member_id)
+            
+    except Exception as e:
+        print(f"❌ Error in ML recommendations: {e}")
+        import traceback
+        traceback.print_exc()
+        return generate_fallback_recommendations(member_id)
+
+def generate_fallback_recommendations(member_id):
+    conn = get_db_connection()
+    c = conn.cursor()
+
+    c.execute("""
+        SELECT DISTINCT b.id, b.title, b.category, b.author
+        FROM issued_books i
+        JOIN books b ON i.book_id = b.id
+        WHERE i.member_id = ?
+    """, (member_id,))
+    history = c.fetchall()
+
+    borrowed_book_ids = {row['id'] for row in history}
+    preferred_categories = {}
+    preferred_authors = {}
+    
+    for row in history:
+        category = row['category']
+        author = row['author']
+        if category:
+            preferred_categories[category] = preferred_categories.get(category, 0) + 1
+        if author:
+            preferred_authors[author] = preferred_authors.get(author, 0) + 1
+
+    c.execute("""
+        SELECT id, title, author, category
+        FROM books
+        WHERE status = 'available'
+        ORDER BY title
+    """)
+    available_books = c.fetchall()
+    conn.close()
+
+    if not available_books:
+        return jsonify([])
+
+    book_scores = []
+    for book in available_books:
+        book_dict = dict(book)
+        
+        if book_dict['id'] in borrowed_book_ids:
+            continue
+        
+        score = 0
+        reasons = []
+
+        if book_dict['category'] in preferred_categories:
+            score += preferred_categories[book_dict['category']] * 3
+            reasons.append(f"You've enjoyed {preferred_categories[book_dict['category']]} book(s) in {book_dict['category']}")
+
+        if book_dict['author'] in preferred_authors:
+            score += preferred_authors[book_dict['author']] * 2
+            reasons.append(f"You've read other books by {book_dict['author']}")
+
+        import random
+        score += random.uniform(0, 0.5)
+
+        if not reasons and preferred_categories:
+            top_category = max(preferred_categories, key=preferred_categories.get)
+            reasons.append(f"This {book_dict['category'] or 'book'} offers a fresh perspective from your usual {top_category} reads")
+        elif not reasons:
+            reasons.append("Popular choice in our library")
+
+        book_scores.append({
+            'book': book_dict,
+            'score': score,
+            'reason': reasons[0] if reasons else "Recommended based on library popularity"
+        })
+
+    book_scores.sort(key=lambda x: x['score'], reverse=True)
+    top_recommendations = book_scores[:5]
+
+    recommendations = []
+    for item in top_recommendations:
+        book = item['book']
+        recommendations.append({
+            'book_id': book['id'],
+            'title': book['title'],
+            'author': book['author'],
+            'category': book['category'] or 'Uncategorized',
+            'reason': item['reason']
+        })
+
+    return jsonify(recommendations)
+
+@app.route('/get_recommended_books/<int:member_id>')
+def get_recommended_books(member_id):
+    conn = get_db_connection()
+    c = conn.cursor()
+
+    c.execute("SELECT id, title, author, category FROM books WHERE status='available'")
+    books = c.fetchall()
+
+    c.execute("""
+        SELECT DISTINCT b.category
+        FROM issued_books i
+        JOIN books b ON i.book_id = b.id
+        WHERE i.member_id = ? AND b.category IS NOT NULL
+    """, (member_id,))
+    preferred_categories = {row['category'] for row in c.fetchall()}
+
+    conn.close()
+
+    all_books = [dict(row) for row in books]
+    
+    for book in all_books:
+        book['recommended'] = book.get('category') in preferred_categories
+        book['is_issued'] = False
+
+    all_books.sort(key=lambda x: (not x['recommended'], x['title'].lower()))
+
+    return jsonify(all_books)
+
+@app.route('/add_book', methods=['POST'])
+@admin_required
+def add_book():
+    data = request.get_json()
+    title = data.get('title', '').strip()
+    author = data.get('author', '').strip()
+    category = data.get('category', '').strip()
+    if not title or not author:
+        return jsonify({"message": "title and author required"}), 400
+    
+    try:
+        conn = sqlite3.connect('library.db')
+        cur = conn.cursor()
+        cur.execute("INSERT INTO books (title, author, category) VALUES (?, ?, ?)", (title, author, category))
+        conn.commit()
+        conn.close()
+        
+        if ML_AVAILABLE:
+            threading.Thread(target=retrain_model, daemon=True).start()
+        
+        return jsonify({"message": "Book added!", "success": True})
+    except Exception as e:
+        print(f"Error adding book: {e}")
+        return jsonify({"message": "Failed to add book", "success": False}), 500
+
+@app.route('/update_book', methods=['POST'])
+@admin_required
+def update_book():
+    data = request.get_json()
+    id_ = data.get('id')
+    title = data.get('title')
+    author = data.get('author')
+    category = data.get('category')
+    status = data.get('status')
+    conn = sqlite3.connect('library.db')
+    cur = conn.cursor()
+    cur.execute("UPDATE books SET title=?, author=?, category=?, status=? WHERE id=?", (title, author, category, status, id_))
+    conn.commit()
+    conn.close()
+    
+    if ML_AVAILABLE:
+        threading.Thread(target=retrain_model, daemon=True).start()
+    
+    return jsonify({"message": "Book updated!"})
+
+@app.route('/delete_book', methods=['POST'])
+@admin_required
+def delete_book():
+    data = request.get_json()
+    id_ = data.get('id')
+    conn = sqlite3.connect('library.db')
+    cur = conn.cursor()
+    cur.execute("DELETE FROM books WHERE id=?", (id_,))
+    conn.commit()
+    conn.close()
+    
+    if ML_AVAILABLE:
+        threading.Thread(target=retrain_model, daemon=True).start()
+    
+    return jsonify({"message": "Book deleted!"})
+
+@app.route('/add_member', methods=['POST'])
+@admin_required
+def add_member():
+    data = request.get_json()
+    name = data.get('name', '').strip()
+    email = data.get('email', '').strip()
+    phone = data.get('phone', '').strip()
+
+    if not name or not name.replace(" ", "").isalpha():
+        return jsonify({"message": "Invalid name format"}), 400
+    if '@' not in email or email.endswith('@'):
+        return jsonify({"message": "Invalid email format"}), 400
+    if not phone.isdigit():
+        return jsonify({"message": "Invalid phone number"}), 400
+
+    try:
+        conn = sqlite3.connect('library.db')
+        cur = conn.cursor()
+        cur.execute("INSERT INTO members (name, email, phone) VALUES (?, ?, ?)", (name, email.lower(), phone))
+        conn.commit()
+        conn.close()
+        return jsonify({"message": "Member added!", "success": True})
+    except Exception as e:
+        print(f"Error adding member: {e}")
+        return jsonify({"message": "Failed to add member", "success": False}), 500
+
+@app.route('/delete_member', methods=['POST'])
+@admin_required
+def delete_member():
+    data = request.get_json()
+    member_id = data.get('id')
+    conn = sqlite3.connect('library.db')
+    cur = conn.cursor()
+    cur.execute("DELETE FROM members WHERE id=?", (member_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"message": "Member deleted!"})
+
+@app.route('/issue_book', methods=['POST'])
+@admin_required
+def issue_book():
+    data = request.get_json()
+    book_id = data.get('book_id')
+    member_id = data.get('member_id')
+
+    issue_date = datetime.now().strftime('%Y-%m-%d')
+    due_date = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d')
+
+    conn = get_db_connection()
+    c = conn.cursor()
+
+    c.execute("SELECT status FROM books WHERE id = ?", (book_id,))
+    book = c.fetchone()
+    if not book or book['status'] != 'available':
+        conn.close()
+        return jsonify({'message': 'Book not available'}), 400
+
+    c.execute("""
+        INSERT INTO issued_books (book_id, member_id, issue_date, due_date)
+        VALUES (?, ?, ?, ?)
+    """, (book_id, member_id, issue_date, due_date))
+    c.execute("UPDATE books SET status = 'borrowed' WHERE id = ?", (book_id,))
+    conn.commit()
+    conn.close()
+
+    if ML_AVAILABLE:
+        threading.Thread(target=retrain_model, daemon=True).start()
+
+    try:
+        recommendations = get_ml_recommendations(member_id, num_recommendations=3) if ML_AVAILABLE else []
+    except:
+        recommendations = []
+
+    return jsonify({
+        'message': f'Book issued successfully! Due on {due_date}.',
+        'success': True,
+        'recommendations': recommendations
+    }), 200
+
+@app.route('/return_book', methods=['POST'])
+@admin_required
+def return_book():
+    data = request.get_json()
+    issue_id = data.get('issue_id')
+
+    conn = get_db_connection()
+    c = conn.cursor()
+
+    return_date = datetime.now().strftime('%Y-%m-%d')
+
+    c.execute("SELECT book_id FROM issued_books WHERE id = ?", (issue_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'message': 'Issue record not found'}), 404
+
+    book_id = row['book_id']
+
+    c.execute("""
+        UPDATE issued_books
+        SET return_date = ?
+        WHERE id = ?
+    """, (return_date, issue_id))
+
+    c.execute("UPDATE books SET status = 'available' WHERE id = ?", (book_id,))
+
+    conn.commit()
+    conn.close()
+
+    if ML_AVAILABLE:
+        threading.Thread(target=retrain_model, daemon=True).start()
+
+    return jsonify({'message': f'Book returned successfully on {return_date}.'}), 200
+
+@app.route('/get_issue_history', methods=['GET'])
+@admin_required
+def get_issue_history():
+    member_id = request.args.get('member_id')
+    book_id = request.args.get('book_id')
+    only_unreturned = request.args.get('only_unreturned') == '1'
+
+    conn = sqlite3.connect('library.db')
+    cur = conn.cursor()
+    q = '''SELECT ib.id, ib.book_id, b.title, ib.member_id, m.name, ib.issue_date, ib.due_date, ib.return_date
+            FROM issued_books ib
+            LEFT JOIN books b ON ib.book_id = b.id
+            LEFT JOIN members m ON ib.member_id = m.id
+            WHERE 1=1'''
+    params = []
+    if member_id:
+        q += " AND ib.member_id=?"; params.append(member_id)
+    if book_id:
+        q += " AND ib.book_id=?"; params.append(book_id)
+    if only_unreturned:
+        q += " AND ib.return_date IS NULL"
+    q += " ORDER BY ib.id DESC"
+    cur.execute(q, params)
+    rows = cur.fetchall()
+    data = []
+    for r in rows:
+        fine = calculate_fine(r[6], r[7]) if r[6] else 0
+        data.append({
+            "issue_id": r[0],
+            "book_id": r[1],
+            "title": r[2],
+            "member_id": r[3],
+            "member_name": r[4],
+            "issue_date": r[5],
+            "due_date": r[6],
+            "return_date": r[7],
+            "fine": fine
+        })
+    conn.close()
+    return jsonify(data)
+
+@app.route('/export_issue_history', methods=['GET'])
+@admin_required
+def export_issue_history():
+    member_id = request.args.get('member_id')
+    book_id = request.args.get('book_id')
+    only_unreturned = request.args.get('only_unreturned') == '1'
+
+    conn = sqlite3.connect('library.db')
+    cur = conn.cursor()
+    q = '''SELECT ib.id, b.title, m.name, ib.issue_date, ib.due_date, ib.return_date
+            FROM issued_books ib
+            LEFT JOIN books b ON ib.book_id = b.id
+            LEFT JOIN members m ON ib.member_id = m.id
+            WHERE 1=1'''
+    params = []
+    if member_id:
+        q += " AND ib.member_id=?"; params.append(member_id)
+    if book_id:
+        q += " AND ib.book_id=?"; params.append(book_id)
+    if only_unreturned:
+        q += " AND ib.return_date IS NULL"
+    q += " ORDER BY ib.id DESC"
+    cur.execute(q, params)
+    rows = cur.fetchall()
+    conn.close()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["issue_id", "book_title", "member_name", "issue_date", "due_date", "return_date", "fine"])
+    for r in rows:
+        fine = calculate_fine(r[4], r[5]) if r[4] else 0
+        writer.writerow([r[0], r[1], r[2], r[3], r[4], r[5], fine])
+    output.seek(0)
+    return send_file(io.BytesIO(output.getvalue().encode('utf-8')),
+                     mimetype='text/csv', download_name='issue_history.csv', as_attachment=True)
+
+@app.route('/export_books', methods=['GET'])
+@admin_required
+def export_books():
+    conn = sqlite3.connect('library.db')
+    cur = conn.cursor()
+    cur.execute("SELECT id, title, author, category, status FROM books")
+    rows = cur.fetchall()
+    conn.close()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["id", "title", "author", "category", "status"])
+    writer.writerows(rows)
+    output.seek(0)
+    return send_file(io.BytesIO(output.getvalue().encode('utf-8')),
+                     mimetype='text/csv', download_name='books.csv', as_attachment=True)
+
+@app.route('/export_members', methods=['GET'])
+@admin_required
+def export_members():
+    conn = sqlite3.connect('library.db')
+    cur = conn.cursor()
+    cur.execute("SELECT id, name, email, phone FROM members")
+    rows = cur.fetchall()
+    conn.close()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["id", "name", "email", "phone"])
+    writer.writerows(rows)
+    output.seek(0)
+    return send_file(io.BytesIO(output.getvalue().encode('utf-8')),
+                     mimetype='text/csv', download_name='members.csv', as_attachment=True)
+
+@app.route('/admin_login', methods=['POST'])
+def admin_login():
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+    conn = sqlite3.connect('library.db')
+    cur = conn.cursor()
+    cur.execute("SELECT password_hash FROM admins WHERE username=?", (username,))
+    r = cur.fetchone()
+    conn.close()
+    if not r or not check_password_hash(r[0], password):
+        return jsonify({"message": "Invalid credentials"}), 401
+    session['admin'] = username
+    return jsonify({"message": "Logged in", "success": True})
+
+@app.route('/admin_logout', methods=['POST'])
+def admin_logout():
+    session.pop('admin', None)
+    return jsonify({"message": "Logged out", "success": True})
+
+@app.route('/retrain_model', methods=['POST'])
+@admin_required
+def manual_retrain():
+    if not ML_AVAILABLE:
+        return jsonify({"message": "ML model not available"}), 503
+    
+    try:
+        threading.Thread(target=retrain_model, daemon=True).start()
+        return jsonify({"message": "Model retraining started in background"}), 200
+    except Exception as e:
+        return jsonify({"message": f"Failed to start retraining: {e}"}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True)

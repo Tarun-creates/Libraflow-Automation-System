@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LibraFlow - Modern Library Management System</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+
+<body>
+    <div class="bg-animation"></div>
+
+    <nav>
+        <div class="nav-container">
+            <div class="logo">📚 LibraFlow</div>
+
+            <div class="search-container">
+                <span class="search-icon">🔍</span>
+                <input id="globalSearch" type="text" class="search-bar" placeholder="Search books..." oninput="searchBooks(event)">
+            </div>
+
+            <div class="nav-actions">
+                <button class="theme-toggle" onclick="toggleTheme()">
+                    <span id="theme-icon">🌙</span>
+                </button>
+                <button class="btn btn-secondary" onclick="openModal('adminLoginModal')">Admin</button>
+                <button class="btn btn-secondary admin-only" onclick="exportBooks()">Export Books</button>
+                <button class="btn btn-secondary admin-only" onclick="exportMembers()">Export Members</button>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <section class="hero">
+            <h1>Welcome to LibraFlow</h1>
+            <p>Smart modern solution for managing your library.</p>
+        </section>
+
+        <section class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-icon">📚</div>
+                <div class="stat-value" id="totalBooks">0</div>
+                <div class="stat-label">Total Books</div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-icon">✅</div>
+                <div class="stat-value" id="availableBooks">0</div>
+                <div class="stat-label">Available</div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-icon">📖</div>
+                <div class="stat-value" id="borrowedBooks">0</div>
+                <div class="stat-label">Borrowed</div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-icon">👤</div>
+                <div class="stat-value" id="totalMembers">0</div>
+                <div class="stat-label">Members</div>
+            </div>
+        </section>
+
+        <section class="quick-actions">
+            <h2 class="section-title">Quick Actions</h2>
+            <div class="action-grid">
+                <div class="action-btn admin-only" onclick="openModal('addBookModal')">
+                    ➕ <span class="action-title">Add Book</span>
+                </div>
+                <div class="action-btn admin-only" onclick="openModal('addMemberModal')">
+                    👤 <span class="action-title">Add Member</span>
+                </div>
+                <div class="action-btn admin-only" onclick="openIssueBookModal()">
+                    📖 <span class="action-title">Issue Book</span>
+                </div>
+
+                <div class="action-btn admin-only" onclick="openModal('returnBookModal')">
+                    🔁 <span class="action-title">Return Book</span>
+                </div>
+            </div>
+        </section>
+
+        
+        <section class="books-section">
+            <h2 class="section-title">Books</h2>
+
+            <div class="filter-tabs">
+                <button class="filter-tab active" onclick="filterBooks('all', this)">All</button>
+                <button class="filter-tab" onclick="filterBooks('available', this)">Available</button>
+                <button class="filter-tab" onclick="filterBooks('borrowed', this)">Borrowed</button>
+            </div>
+
+            <div style="display:flex; justify-content:flex-end; margin-bottom:1rem;">
+                <select id="sortSelect" class="form-input" style="width:200px;" onchange="changeSort()">
+                    <option value="title-asc">Title (A → Z)</option>
+                    <option value="title-desc">Title (Z → A)</option>
+                    <option value="author-asc">Author (A → Z)</option>
+                    <option value="author-desc">Author (Z → A)</option>
+                    <option value="category-asc">Category (A → Z)</option>
+                    <option value="category-desc">Category (Z → A)</option>
+                </select>
+            </div>
+
+            <div id="booksGrid" class="books-grid"></div>
+
+            <div id="pagination"></div>
+        </section>
+
+        <section class="members-section" style="margin-top:2rem;">
+            <h2 class="section-title">Members</h2>
+            <div style="display:flex; gap:1rem; align-items:center; margin-bottom:1rem;">
+                <input id="membersSearchInput" type="text" class="search-bar" placeholder="Search members..." oninput="searchMembers(event)">
+            </div>
+            <div id="membersGrid" class="members-grid"></div>
+            <div id="membersPagination"></div>
+        </section>
+
+        <section style="margin-top:1.5rem;">
+            <canvas id="booksChart" style="max-width:700px;"></canvas>
+            <canvas id="categoriesChart" style="max-width:700px; margin-top:1rem;"></canvas>
+        </section>
+
+    </main>
+
+    {% include 'modals.html' %}
+    <div id="notification" class="notification"></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+
+
+<div id="aiRecommendationModal" class="modal">
+  <div class="modal-content" style="max-width: 700px;">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+      <h2 style="margin: 0;">🤖 AI Book Recommendations</h2>
+      <button class="btn btn-secondary" onclick="closeModal('aiRecommendationModal')" style="padding: 0.3rem 0.8rem;">✖</button>
+    </div>
+    
+    <div id="aiRecommendationBody" style="min-height: 200px;">
+    </div>
+    
+    <div style="margin-top: 1.5rem; display: flex; gap: 1rem; justify-content: flex-end;">
+      <button id="getAIRecommendations" class="btn btn-primary" onclick="getAIRecommendations()">
+        🚀 Generate AI Recommendations
+      </button>
+      <button class="btn btn-secondary" onclick="closeModal('aiRecommendationModal')">
+        Close
+      </button>
+    </div>
+  </div>
+</div>
+
+<style>
+
+.loader {
+  border: 4px solid var(--text-secondary);
+  border-top: 4px solid var(--primary);
+  border-radius: 50%;
+  width: 40px;
+  height: 40px;
+  animation: spin 1s linear infinite;
+  margin: 0 auto;
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+</style>
+
+</body>
+</html>
